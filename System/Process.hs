@@ -115,7 +115,8 @@ proc cmd args = CreateProcess { cmdspec = RawCommand cmd args,
                                 create_new_console = False,
                                 new_session = False,
                                 child_group = Nothing,
-                                child_user = Nothing }
+                                child_user = Nothing,
+                                use_process_jobs = False }
 
 -- | Construct a 'CreateProcess' record for passing to 'createProcess',
 -- representing a command to be passed to the shell.
@@ -133,7 +134,8 @@ shell str = CreateProcess { cmdspec = ShellCommand str,
                             create_new_console = False,
                             new_session = False,
                             child_group = Nothing,
-                            child_user = Nothing }
+                            child_user = Nothing,
+                            use_process_jobs = False }
 
 {- |
 This is the most general way to spawn an external process.  The
@@ -178,7 +180,8 @@ Note that @Handle@s provided for @std_in@, @std_out@, or @std_err@ via the
 @UseHandle@ constructor will be closed by calling this function. This is not
 always the desired behavior. In cases where you would like to leave the
 @Handle@ open after spawning the child process, please use 'createProcess_'
-instead.
+instead. All created @Handle@s are initially in text mode; if you need them
+to be in binary mode then use 'hSetBinaryMode'.
 
 -}
 createProcess
@@ -210,6 +213,7 @@ createProcess cp = do
 -- > withCreateProcess (proc cmd args) { ... }  $ \_ _ _ ph -> do
 -- >   ...
 --
+-- @since 1.4.3.0
 -}
 withCreateProcess
   :: CreateProcess
@@ -592,8 +596,9 @@ waitForProcess ph@(ProcessHandle _ delegating_ctlc) = do
           throwErrnoIfMinus1Retry_ "waitForProcess" (c_waitForProcess h pret)
           modifyProcessHandle ph $ \p_' ->
             case p_' of
-              ClosedHandle e -> return (p_',e)
-              OpenHandle ph' -> do
+              ClosedHandle e  -> return (p_', e)
+              OpenExtHandle{} -> return (p_', ExitFailure (-1))
+              OpenHandle ph'  -> do
                 closePHANDLE ph'
                 code <- peek pret
                 let e = if (code == 0)
@@ -603,7 +608,14 @@ waitForProcess ph@(ProcessHandle _ delegating_ctlc) = do
         when delegating_ctlc $
           endDelegateControlC e
         return e
-
+    OpenExtHandle _ job iocp ->
+#if defined(WINDOWS)
+        maybe (ExitFailure (-1)) mkExitCode `fmap` waitForJobCompletion job iocp timeout_Infinite
+      where mkExitCode code | code == 0 = ExitSuccess
+                            | otherwise = ExitFailure $ fromIntegral code
+#else
+        return $ ExitFailure (-1)
+#endif
 
 -- ----------------------------------------------------------------------------
 -- getProcessExitCode
@@ -622,22 +634,29 @@ getProcessExitCode ph@(ProcessHandle _ delegating_ctlc) = do
   (m_e, was_open) <- modifyProcessHandle ph $ \p_ ->
     case p_ of
       ClosedHandle e -> return (p_, (Just e, False))
-      OpenHandle h ->
+      open -> do
         alloca $ \pExitCode -> do
-            res <- throwErrnoIfMinus1Retry "getProcessExitCode" $
-                        c_getProcessExitCode h pExitCode
-            code <- peek pExitCode
-            if res == 0
-              then return (p_, (Nothing, False))
-              else do
-                   closePHANDLE h
-                   let e  | code == 0 = ExitSuccess
-                          | otherwise = ExitFailure (fromIntegral code)
-                   return (ClosedHandle e, (Just e, True))
+          case getHandle open of
+            Nothing -> return (p_, (Nothing, False))
+            Just h  -> do
+                res <- throwErrnoIfMinus1Retry "getProcessExitCode" $
+                                        c_getProcessExitCode h pExitCode
+                code <- peek pExitCode
+                if res == 0
+                   then return (p_, (Nothing, False))
+                   else do
+                        closePHANDLE h
+                        let e  | code == 0 = ExitSuccess
+                               | otherwise = ExitFailure (fromIntegral code)
+                        return (ClosedHandle e, (Just e, True))
   case m_e of
     Just e | was_open && delegating_ctlc -> endDelegateControlC e
     _                                    -> return ()
   return m_e
+    where getHandle :: ProcessHandle__ -> Maybe PHANDLE
+          getHandle (OpenHandle        h) = Just h
+          getHandle (ClosedHandle      _) = Nothing
+          getHandle (OpenExtHandle h _ _) = Just h
 
 
 -- ----------------------------------------------------------------------------
@@ -662,8 +681,13 @@ terminateProcess :: ProcessHandle -> IO ()
 terminateProcess ph = do
   withProcessHandle ph $ \p_ ->
     case p_ of
-      ClosedHandle _ -> return ()
-      OpenHandle h -> do
+      ClosedHandle  _ -> return ()
+#if defined(WINDOWS)
+      OpenExtHandle{} -> terminateJob ph 1 >> return ()
+#else
+      OpenExtHandle{} -> error "terminateProcess with OpenExtHandle should not happen on POSIX."
+#endif
+      OpenHandle    h -> do
         throwErrnoIfMinus1Retry_ "terminateProcess" $ c_terminateProcess h
         return ()
         -- does not close the handle, we might want to try terminating it
@@ -773,8 +797,7 @@ runProcess cmd args mb_cwd mb_env mb_stdin mb_stdout mb_stderr = do
 
 {- | Runs a command using the shell, and returns 'Handle's that may
      be used to communicate with the process via its @stdin@, @stdout@,
-     and @stderr@ respectively. The 'Handle's are initially in binary
-     mode; if you need them to be in text mode then use 'hSetBinaryMode'.
+     and @stderr@ respectively.
 -}
 runInteractiveCommand
   :: String
@@ -796,9 +819,6 @@ runInteractiveCommand string =
 
 >   (inp,out,err,pid) <- runInteractiveProcess "..."
 >   forkIO (hPutStr inp str)
-
-    The 'Handle's are initially in binary mode; if you need them to be
-    in text mode then use 'hSetBinaryMode'.
 -}
 runInteractiveProcess
   :: FilePath                   -- ^ Filename of the executable (see 'RawCommand' for details)
